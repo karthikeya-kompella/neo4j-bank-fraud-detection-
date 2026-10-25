@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Graph Fraud Ring Detector</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; display: flex; height: 100vh; }
+  aside { width: 400px; border-right: 1px solid #1e293b; display: flex; flex-direction: column; }
+  header { padding: 14px 16px; border-bottom: 1px solid #1e293b; }
+  header h1 { font-size: 16px; margin: 0 0 4px; }
+  header small { color: #94a3b8; }
+  nav { display: flex; }
+  nav button { flex: 1; padding: 10px 0; background: #111c33; color: #94a3b8; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
+  nav button.active { color: #fff; border-bottom-color: #38bdf8; background: #16233f; }
+  #list { overflow-y: auto; flex: 1; padding: 8px; }
+  .card { background: #16233f; border: 1px solid #1e293b; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; font-size: 13px; }
+  .card:hover { border-color: #38bdf8; }
+  .card b { color: #fff; }
+  .muted { color: #94a3b8; }
+  .score { float: right; font-weight: 700; padding: 2px 8px; border-radius: 10px; background: #7f1d1d; color: #fecaca; }
+  main { flex: 1; position: relative; }
+  #net { position: absolute; inset: 0; }
+  #legend { position: absolute; left: 12px; bottom: 12px; background: #111c33cc; padding: 8px 12px; border-radius: 8px; font-size: 12px; }
+  #legend span { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin: 0 4px 0 10px; }
+  #hint { position: absolute; top: 12px; left: 12px; color: #94a3b8; font-size: 13px; }
+</style>
+</head>
+<body>
+<aside>
+  <header>
+    <h1>Graph Fraud Ring Detector</h1>
+    <small id="stats">connecting...</small>
+  </header>
+  <nav>
+    <button data-tab="rings" class="active">Rings</button>
+    <button data-tab="cycles">Cycles</button>
+    <button data-tab="mules">Mules</button>
+    <button data-tab="risk">Risk</button>
+  </nav>
+  <div id="list"></div>
+</aside>
+<main>
+  <div id="hint">Pick an item on the left to draw its subgraph.</div>
+  <div id="net"></div>
+  <div id="legend">
+    <span style="background:#38bdf8"></span>Customer
+    <span style="background:#4ade80"></span>Account
+    <span style="background:#fb923c"></span>Device
+    <span style="background:#c084fc"></span>Address
+    <span style="background:#f87171"></span>Phone
+  </div>
+</main>
+
+<script>
+const COLORS = { Customer: "#38bdf8", Account: "#4ade80", Device: "#fb923c", Address: "#c084fc", Phone: "#f87171" };
+const listEl = document.getElementById("list");
+let network = null;
+
+async function api(path) {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(path + " -> " + res.status);
+  return res.json();
+}
+
+function money(n) { return Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 }); }
+
+async function drawGraph(customers = [], accounts = []) {
+  const qs = new URLSearchParams();
+  customers.forEach(c => qs.append("customers", c));
+  accounts.forEach(a => qs.append("accounts", a));
+  const g = await api("/graph?" + qs.toString());
+  document.getElementById("hint").style.display = "none";
+
+  const nodes = g.nodes.map(n => ({
+    id: n.id, label: n.label, shape: "dot",
+    size: n.group === "Customer" ? 16 : 12,
+    color: COLORS[n.group] || "#94a3b8",
+    font: { color: "#e2e8f0", size: 11 },
+  }));
+  const edges = g.edges.map(e => ({
+    from: e.from, to: e.to, arrows: e.arrows || "",
+    label: e.kind === "owns" ? "" : e.label,
+    color: { color: e.kind === "transfer" ? "#facc15" : "#475569" },
+    width: e.kind === "transfer" ? 2 : 1,
+    dashes: e.kind === "identity",
+    font: { color: "#cbd5e1", size: 10, strokeWidth: 0 },
+    smooth: e.kind === "transfer" ? { type: "curvedCW", roundness: 0.2 } : false,
+  }));
+
+  const data = { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) };
+  if (network) network.destroy();
+  network = new vis.Network(document.getElementById("net"), data, {
+    physics: { stabilization: { iterations: 150 }, barnesHut: { springLength: 120 } },
+    interaction: { hover: true },
+  });
+}
+
+const renderers = {
+  async rings() {
+    const rows = await api("/rings");
+    return rows.map(r => ({
+      html: `<b>${r.ring_id}</b> <span class="muted">size ${r.size}</span><br>
+             ${r.shared_identifiers.length} shared identifiers &middot; ${r.internal_transfers} internal transfers
+             (${money(r.internal_volume)})`,
+      click: () => drawGraph(r.customers, []),
+    }));
+  },
+  async cycles() {
+    const rows = await api("/cycles");
+    return rows.map(c => ({
+      html: `<b>${c.hops}-hop loop</b> <span class="muted">${money(c.total)} moved in ${c.span_hours}h</span><br>
+             ${c.accounts.join(" &rarr; ")} &rarr; ${c.accounts[0]}`,
+      click: () => drawGraph([], c.accounts),
+    }));
+  },
+  async mules() {
+    const rows = await api("/mules");
+    return rows.map(m => ({
+      html: `<b>${m.account}</b> <span class="muted">${m.name}</span><br>
+             ${m.senders} senders in &rarr; ${money(m.in_amount)} in, ${money(m.out_amount)} out`,
+      click: () => drawGraph([], [m.account, ...m.sender_ids, ...m.receiver_ids]),
+    }));
+  },
+  async risk() {
+    const rows = await api("/risk?top=40");
+    return rows.map(r => ({
+      html: `<span class="score">${r.score}</span><b>${r.customer}</b> <span class="muted">${r.name}</span><br>
+             ${r.reasons.map(x => "&bull; " + x).join("<br>")}`,
+      click: () => drawGraph([r.customer], []),
+    }));
+  },
+};
+
+async function show(tab) {
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  listEl.innerHTML = '<p class="muted" style="padding:8px">Running Cypher...</p>';
+  try {
+    const items = await renderers[tab]();
+    listEl.innerHTML = "";
+    if (!items.length) listEl.innerHTML = '<p class="muted" style="padding:8px">Nothing found.</p>';
+    items.forEach(it => {
+      const div = document.createElement("div");
+      div.className = "card";
+      div.innerHTML = it.html;
+      div.onclick = it.click;
+      listEl.appendChild(div);
+    });
+  } catch (e) {
+    listEl.innerHTML = '<p style="padding:8px;color:#fca5a5">' + e.message + "</p>";
+  }
+}
+
+document.querySelectorAll("nav button").forEach(b => (b.onclick = () => show(b.dataset.tab)));
+
+(async () => {
+  try {
+    const s = await api("/stats");
+    document.getElementById("stats").textContent =
+      s.nodes.map(n => n.count + " " + n.label).join(" · ") + " · " +
+      s.relationships.reduce((a, r) => a + r.count, 0) + " relationships";
+  } catch (e) {
+    document.getElementById("stats").textContent = "API/Neo4j not reachable";
+  }
+  show("rings");
+})();
+</script>
+</body>
+</html>
